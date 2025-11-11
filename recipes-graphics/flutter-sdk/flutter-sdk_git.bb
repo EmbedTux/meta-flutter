@@ -39,6 +39,8 @@ require conf/include/flutter-version.inc
 
 PV = "${FLUTTER_SDK_VERSION}"
 
+RM_WORK_EXCLUDE += "${PN}"
+
 inherit pkgconfig
 
 SRC_URI = "\
@@ -76,6 +78,89 @@ def run_command(d, cmd, cwd, env):
         bb.error("failed %s (cmd was %s)%s" % (retval, cmd, ":\n%s" % output if output else ""))
         return
 
+require conf/include/gn-utils.inc
+
+# Add the Dart SDK as an explicit source so Yocto handles its download and mirroring
+# This allow to solve build in NO_NETWORK mode.
+SRC_URI += "https://storage.googleapis.com/flutter_infra_release/flutter/${@gn_get_engine_commit(d)}/dart-sdk-linux-x64.zip;name=dart-sdk"
+
+# Replace this checksum with the real one from 'sha256sum dart-sdk-linux-x64.zip'
+SRC_URI[dart-sdk.sha256sum] = "43db554b66866480a181adfbec3b65d78c47882bf366cd511f22737497fceabd"
+
+
+def patch_dart_sdk_download(d, bb):
+    import os, subprocess
+
+    # V3.2
+    # Prevent Flutter from trying to download Dart SDK during unpack task
+    # and inject the local archive download by the recipe instead
+    # update_script = os.path.join(d.getVar('S'), 'bin', 'internal', 'update_dart_sdk.sh')
+    # if os.path.exists(update_script):
+    #     # Skip curl-based download logic
+    #     subprocess.call(['sed', '-Ei',
+    #                      's/(curl \$\{verbose_curl\} --retry 3 --continue-at - --location --output "\$DART_SDK_ZIP" "\$DART_SDK_URL" 2>&1 \|\| \{)/true || \1/',
+    #                      update_script])
+    # else:
+    #     bb.error("failed: Can't find the update_dart_sdk.sh file to patch it.")
+    shared_script = os.path.join(d.getVar('S'), 'bin', 'internal', 'shared.sh')
+    if os.path.exists(shared_script):
+        # Skip update dart sdk logic
+        subprocess.call(['sed', '-Ei',
+                         's|( \"\$FLUTTER_ROOT/bin/internal/update_dart_sdk.sh\")|#\1|',
+                         shared_script])
+    else:
+        bb.error("failed: Can't find the shared.sh file to patch it.")
+
+    # Unpack pre-fetched Dart SDK into expected location
+    workdir = d.getVar('WORKDIR')
+    sourcedir = d.getVar('S')
+    cachedir = os.path.join(sourcedir, 'bin', 'cache')
+    os.makedirs(cachedir, exist_ok=True)
+
+    dart_sdk_path = os.path.join(cachedir, 'dart-sdk')
+    if os.path.exists(dart_sdk_path):
+        subprocess.check_call(['rm', '-rf', dart_sdk_path])
+
+    extracted_dart_sdk = os.path.join(workdir, 'dart-sdk')
+    if os.path.exists(extracted_dart_sdk):
+        subprocess.check_call(['mv', '-f', extracted_dart_sdk, cachedir])
+        subprocess.check_call(['find', dart_sdk_path, '-type', 'd', '-exec', 'chmod', '755', '{}', ';'])
+        subprocess.check_call(['find', dart_sdk_path, '-type', 'f', '-perm', '/u+x', '-exec', 'chmod', 'a+x,a+r', '{}', ';'])
+
+        # TODO echo "$ENGINE_VERSION" > "$ENGINE_STAMP"
+        engine_stamp=os.path.join(cachedir, 'engine-dart-sdk.stamp')
+        engine_version = os.path.join(sourcedir, 'bin', 'internal', 'engine.version')
+        subprocess.check_call(['cp', engine_version, engine_stamp])
+        # engine_version = open(engine_stamp, 'r').readline();
+        # ENGINE_VERSION=$(cat "$FLUTTER_ROOT/bin/internal/engine.version")
+    else:
+        bb.error("failed: Can't find dart-sdk extracted source file.")
+
+# def patch_pub_spec_download(d):
+#     import os, subprocess
+
+#     # Prevent Flutter from trying to download Dart SDK during build
+#     # and inject the local archive download by the recipe instead
+#     update_script = os.path.join(d.getVar('S'), 'bin', 'internal', 'update_dart_sdk.sh')
+#     if os.path.exists(update_script):
+#         # Skip curl-based download logic
+#         subprocess.call(['sed', '-Ei',
+#                          's/(curl \$\{verbose_curl\} --retry 3 --continue-at - --location --output "\$DART_SDK_ZIP" "\$DART_SDK_URL" 2>&1 \|\| \{)/true || \1/',
+#                          update_script])
+#     else:
+#         bb.error("failed: Can't find the update_dart_sdk.sh file to patch it.")
+
+#     # Unpack pre-fetched Dart SDK into expected location
+#     workdir = d.getVar('WORKDIR')
+#     sourcedir = d.getVar('S')
+#     cachedir = os.path.join(sourcedir, 'bin', 'cache')
+#     os.makedirs(cachedir, exist_ok=True)
+
+#     dart_zip = os.path.join(workdir, 'dart-sdk-linux-x64.zip')
+#     if os.path.exists(dart_zip):
+#         subprocess.check_call(['unzip', '-q', dart_zip, '-d', cachedir])
+#     else:
+#         note.error("failed: Can't find dart-sdk-linux-x64.zip source file.")
 
 do_unpack[network] = "1"
 do_unpack[depends] += " \
@@ -85,7 +170,7 @@ do_unpack[depends] += " \
     unzip-native:do_populate_sysroot \
 "
 python do_unpack:append() {
-    import shutil
+    import os, shutil
 
     # clean cache folder if it exists
     source_dir = d.getVar('S')
@@ -138,7 +223,10 @@ python do_unpack:append() {
 
     # check your installation and build the initial snapshot of the `flutter` tool
     run_command(d, 'flutter doctor -v', source_dir, env)
-    
+
+
+    patch_dart_sdk_download(d, bb)
+
     # download all of the pub package dependencies needed to build any of the packages in the Flutter main distribution
     run_command(d, 'flutter update-packages', source_dir, env)
 
