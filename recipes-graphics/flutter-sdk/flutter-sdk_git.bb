@@ -74,7 +74,7 @@ def run_command(d, cmd, cwd, env):
     (retval, output) = getstatusoutput(cmd, cwd, env)
     if retval:
         bb.error("failed %s (cmd was %s)%s" % (retval, cmd, ":\n%s" % output if output else ""))
-        return
+        return retval
 
 
 do_unpack[network] = "1"
