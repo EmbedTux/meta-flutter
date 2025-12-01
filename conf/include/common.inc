@@ -33,7 +33,10 @@ PUBSPEC_IGNORE_LOCKFILE ??= "0"
 
 FLUTTER_SDK = "${STAGING_DIR_NATIVE}/usr/share/flutter/sdk"
 
+inherit pubcache-fetcher
+
 require conf/include/clang-utils.inc
+require conf/include/compute_pubcache_hash.inc
 
 python () {
     d.setVar('FLUTTER_SDK_VERSION', get_flutter_sdk_version(d))
@@ -66,38 +69,28 @@ def run_command(d, cmd, cwd, env):
         bb.note(f'Output:{formatted_output}')
         bb.fatal(f'{cmd} failed: {retval}')
 
-def md5_update_from_dir(directory, hash):
-    from pathlib import Path
-    assert Path(directory).is_dir()
-    for path in sorted(Path(directory).iterdir(), key=lambda p: str(p).lower()):
-        hash.update(path.name.encode())
-        if path.is_file():
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    hash.update(chunk)
-        elif path.is_dir():
-            hash = md5_update_from_dir(path, hash)
-    return hash
-
-def md5_dir(directory):
-    import hashlib
-    return md5_update_from_dir(directory, hashlib.md5()).hexdigest()
 
 def get_pub_cache_archive_name(d, app_root):
     """
     Returns unique pub cache archive name
     """
-    app_root_md5 = md5_dir(app_root)
+    import os
+
     pn = d.getVar('PN')
     flutter_sdk_tag = d.getVar('FLUTTER_SDK_TAG')
-    pub_cache_archive = f'flutter-pub-cache-{pn}-{app_root_md5}-{flutter_sdk_tag}.tar.bz2'
+    pubspec = os.path.join(app_root, "pubspec.yaml")
 
-    workspace = d.getVar('WORKDIR')
-    file = os.path.join(workspace, 'PUB_CACHE_ARCHIVE')
-    with open(file, 'w+') as f:
-        f.write(pub_cache_archive)
+    # TODO: Document why this instead of platform bundle vs web.
+    build_type = d.getVar('BUILD_TYPE')
 
-    return pub_cache_archive
+    # Compute the hash using the python tool
+    pub_cache_hash = compute_pubcache_hash(d, pubspec, flutter_sdk_tag, build_type)
+
+    bb.note(f"Computed Flutter pub cache hash: {pub_cache_hash}")
+
+    pub_cache_archive_name = f'flutter-pub-cache-{pn}-{pub_cache_hash}-{flutter_sdk_tag}.tar.bz2'
+
+    return pub_cache_archive_name
 
 def get_archive_pub_cache_environment(d, pub_cache, flutter_sdk):
     """
@@ -162,35 +155,51 @@ def get_archive_pub_cache_environment(d, pub_cache, flutter_sdk):
 
 addtask archive_pub_cache before restore_pub_cache after do_patch
 do_archive_pub_cache[network] = "1"
-do_archive_pub_cache[dirs] = "${WORKDIR} ${DL_DIR}"
+do_archive_pub_cache[dirs] = "${DL_DIR} ${WORKDIR}"
 do_archive_pub_cache[depends] += " \
     flutter-sdk-native:do_populate_sysroot \
     pbzip2-native:do_populate_sysroot \
     tar-native:do_populate_sysroot \
+    python3-pyyaml-native:do_populate_sysroot \
     "
 python do_archive_pub_cache() {
 
     import errno
     import multiprocessing
+    import subprocess
+    from   bb.fetch2 import subprocess_setup
+    from   bb.fetch2 import UnpackError
     import shutil
     from bb.fetch2 import FetchError
 
+    # if PUB_CACHE_ARCHIVE file exist, get {localfile} and return if exist
     workspace = d.getVar('WORKDIR')
+    app_root = os.path.join(d.getVar("S"), d.getVar("FLUTTER_APPLICATION_PATH"))
+    pub_cache_archive_name = get_pub_cache_archive_name(d, app_root)
     pub_cache_archive_file = os.path.join(workspace, 'PUB_CACHE_ARCHIVE')
     if os.path.exists(pub_cache_archive_file):
+        bb.note("PUB_CACHE_ARCHIVE file exist.")
         with open(pub_cache_archive_file, 'r') as f:
-            localfile = f.read()
-            if os.path.exists(localfile):
+            pub_cache_archive_old_name = f.read()
+            if pub_cache_archive_old_name == pub_cache_archive_name:
+                bb.note('PUB_CACHE_ARCHIVE file already exist and its content is valid. It is considered that the archive is already in the download folder.')
                 return
 
-    app_root = os.path.join(d.getVar("S"), d.getVar("FLUTTER_APPLICATION_PATH"))
-    localfile = get_pub_cache_archive_name(d, app_root)
-    localpath = os.path.join(d.getVar("DL_DIR"), localfile)
+    if d.getVar("BB_NO_NETWORK") == "1":
+        bb.note('Skip archive pub cache as BB_NO_NETWORK == 1. Pub cache must be present in download folder or in mirror.')
+        # Save the pub cache archive name:
+        # - To be reused by restore_pub_cache
+        # - If archive doesn't exist restore_pub_cache will fail.
+        # Note: If network is reactivated after passing here, the archive will not be create until a clean of the recipe.
+        with open(pub_cache_archive_file, 'w+') as f:
+            f.write(pub_cache_archive_name)
+            return
 
     pub_cache = d.getVar("PUB_CACHE")
     flutter_sdk = os.path.join(d.getVar("STAGING_DATADIR_NATIVE"), 'flutter/sdk')
     flutter_sdk_pub_cache = os.path.join(flutter_sdk, '.pub-cache')
 
+    # Copy flutter sdk pub_cache to local pub_cache
     shutil.rmtree(pub_cache, ignore_errors=True)
     shutil.copytree(flutter_sdk_pub_cache, pub_cache)
 
@@ -237,19 +246,45 @@ python do_archive_pub_cache() {
     run_command(d, 'flutter pub get --enforce-lockfile', app_root, env)
     run_command(d, 'flutter pub get --enforce-lockfile --offline', app_root, env)
 
-    cp_cmd = f'mkdir -p {pub_cache}/.project | true; cp -rT . {pub_cache}/.project/ | true;'
-    run_command(d, cp_cmd, app_root, env)
+    # archive project & flutter pub get artifacts
+    cmd = \
+        f'mkdir -p {pub_cache}/.project | true;' \
+        f'cp -r .dart_tool {pub_cache}/.project/ | true; ' \
+        f'cp .packages {pub_cache}/.project/ | true; ' \
+        f'cp .flutter-plugins {pub_cache}/.project/ | true; ' \
+        f'cp .flutter-plugins-dependencies {pub_cache}/.project/ | true; ' \
+        f'cp pubspec.lock {pub_cache}/.project/ | true; '
 
+    bb.note(f'Running [{cmd}] in {app_root}')
+    ret = subprocess.call(cmd, preexec_fn=subprocess_setup, shell=True, cwd=app_root)
+
+    # TODO fix error exception type and message
+    if ret != 0:
+        raise FetchError(f'Pack command {cmd} failed with return value {ret}', localpath)
+
+    localpath = os.path.join(d.getVar("DL_DIR"), pub_cache_archive_name)
     bb_number_threads = d.getVar("BB_NUMBER_THREADS", multiprocessing.cpu_count()).strip()
     pack_cmd = f'tar -I \"pbzip2 -p{bb_number_threads}\" -cf {localpath} ./'
     run_command(d, pack_cmd, pub_cache, env)
 
+    # TODO fix error exception type and message
     if not os.path.exists(localpath):
         raise FetchError(f'The fetch command returned success for pub cache, but {localpath} does not exist?!', localpath)
 
+    # TODO fix error exception type and message
     if os.path.getsize(localpath) == 0:
         os.remove(localpath)
         raise FetchError(f'The fetch of {localpath} resulted in a zero size file?! Deleting and failing since this is not right.', localpath)
+
+    # Create an empty done file as pubcache fetcher doesn't support checksum.
+    with open(os.path.join(localpath, ".done"), "wb"):
+        pass
+
+    # Save the pub cache archive name:
+    # - Indicating it has been archived
+    # - To be reused by restore_pub_cache
+    with open(pub_cache_archive_file, 'w+') as f:
+        f.write(pub_cache_archive_name)
 }
 
 #
@@ -279,30 +314,29 @@ python do_restore_pub_cache() {
         localfile = f.read()
         if not localfile:
             assert False
-    localpath = os.path.join(d.getVar("DL_DIR"), localfile)
 
-    bb_number_threads = d.getVar("BB_NUMBER_THREADS", multiprocessing.cpu_count()).strip()
-    cmd = f'pbzip2 -dc -p{bb_number_threads} {localpath} | tar x --no-same-owner -f -'
+    # Use dummy pubcache fetcher to retrieve pubcache archive in DL_DIR or in PREMIRRORS
     unpackdir = d.getVar("PUB_CACHE")
-    shutil.rmtree(unpackdir, ignore_errors=True)
-    bb.utils.mkdirhier(unpackdir)
-    path = d.getVar('PATH')
-    if path: cmd = f'PATH=\"{path}\" {cmd}'
-    bb.note(f'Running [{cmd}] in {unpackdir}')
-    ret = subprocess.call(cmd, preexec_fn=subprocess_setup, shell=True, cwd=unpackdir)
-
-    if ret != 0:
-        raise UnpackError(f'Unpack command {cmd} failed with return value {ret}', localpath)
+    src_uri = f"pubcache://invalid.org/{localfile}"
+    bb.note(f"fetch URL: {src_uri}")
+    try:
+        fetcher = bb.fetch2.Fetch([src_uri], d)
+        fetcher.download()
+        shutil.rmtree(unpackdir, ignore_errors=True)
+        os.makedirs(unpackdir, exist_ok=True)
+        fetcher.unpack(unpackdir)
+    except bb.fetch2.BBFetchException as e:
+        bb.fatal(str(e))
 
     # restore flutter pub get artifacts
     cmd = \
+        f'rm -rf {app_root}/.dart_tool | true; ' \
+        f'rm -rf {app_root}/.packages | true; ' \
         f'mv .project/.dart_tool {app_root}/ | true; ' \
         f'mv .project/.packages {app_root}/ | true; ' \
-        f'mv .project/.dart_tool {app_root}/ | true; ' \
         f'mv .project/.flutter-plugins {app_root}/ | true; ' \
         f'mv .project/.flutter-plugins-dependencies {app_root}/ | true; ' \
-        f'mv .project/.metadata {app_root}/ | true; ' \
-        f'mv .project/.packages {app_root}/ | true; ' \
+        f'mv .project/pubspec.lock {app_root}/ | true; ' \
         'rm -rf .project'
     bb.note(f'Running [{cmd}] in {unpackdir}')
     ret = subprocess.call(cmd, preexec_fn=subprocess_setup, shell=True, cwd=unpackdir)
@@ -321,19 +355,9 @@ python do_cleanall:append() {
     file = os.path.join(workspace, 'PUB_CACHE_ARCHIVE')
     if not os.path.exists(file):
         return
-    
-    localfile = ''
-    with open(file, 'r') as f:
-        localfile = f.read()
-        if not localfile:
-            assert False
-
-    localpath = os.path.join(d.getVar("DL_DIR"), localfile)
-
-    bb.note(f'Removing [{localpath}]')
 
     try:
-        os.remove(localpath)
+        os.remove(file)
     except OSError:
         pass
 }
@@ -372,7 +396,6 @@ python do_compile() {
 
     run_command(d, 'flutter config --no-analytics', source_root, env)
     run_command(d, 'flutter config --no-cli-animations', source_root, env)
-    run_command(d, 'flutter pub get --enforce-lockfile --offline -v', source_root, env)
 
     build_type = d.getVar('BUILD_TYPE')
 
@@ -390,8 +413,11 @@ def build_web(d, source_root, env):
     if os.path.exists(build_folder):
         run_command(d, 'flutter clean', source_root, env)
 
+    # After a clean, force an offline pub get to allowbuild command using --no-pub avoiding to use the network.
+    run_command(d, 'flutter pub get --enforce-lockfile --offline -v', source_root, env)
+
     flutter_build_args = d.getVar('FLUTTER_BUILD_ARGS')
-    run_command(d, f'flutter build web {flutter_build_args}', source_root, env)
+    run_command(d, f'flutter build web {flutter_build_args} --no-pub', source_root, env)
 
     bb.note(f'Flutter build web {flutter_build_args}: Completed')
 
@@ -415,6 +441,10 @@ def build_app(d, source_dir, flutter_sdk, pubspec_appname, flutter_application_p
         bb.note(f'Using new build scheme')
         new_build_scheme = True
 
+    # engine_sdk_path = os.path.join(source_root, 'engine_sdk')
+    # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+    # bb.note(f'engine_sdk is {present}')
+
     for runtime_mode in flutter_runtime_modes:
         if runtime_mode not in flutter_app_runtime_modes:
             bb.note(f'Skipping build for: {runtime_mode}')
@@ -424,14 +454,29 @@ def build_app(d, source_dir, flutter_sdk, pubspec_appname, flutter_application_p
 
         build_folder = os.path.join(source_root, 'build')
         if os.path.exists(build_folder):
+            # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+            # bb.note(f'engine_sdk is {present}')
             run_command(d, 'flutter clean -v', source_root, env)
+            # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+            # bb.note(f'engine_sdk is {present}')
+
+        # This is not really needed if clean isn't done.
+        # Great to do it once to make sure dependency are ok.
+        # So, it could be done once if build folder not there and after clean afterward.
+        # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+        # bb.note(f'engine_sdk is {present}')
+        run_command(d, 'flutter pub get --enforce-lockfile --offline -v', source_root, env)
+        # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+        # bb.note(f'engine_sdk is {present}')
 
         if runtime_mode == 'jit_release':
             cmd = (f'flutter build {flutter_build_args} --local-engine -v')
             run_command(cmd, source_root, env)
         else:
-            cmd = f'flutter build {flutter_build_args} -v'
+            cmd = f'flutter build {flutter_build_args} --no-pub -v'
             run_command(d, cmd, source_root, env)
+            # present = 'present' if os.path.exists(engine_sdk_path) else 'NOT present'
+            # bb.note(f'engine_sdk is {present}')
 
         bb.note(f'[{runtime_mode}] flutter build {flutter_build_args}: Completed')
 
@@ -448,7 +493,7 @@ def build_app(d, source_dir, flutter_sdk, pubspec_appname, flutter_application_p
             flutter_app_profile_flags = ''
             flutter_app_vm_profile = 'false'
             if runtime_mode == 'profile':
-                flutter_app_profile_flags = '--track-widget-creation' 
+                flutter_app_profile_flags = '--track-widget-creation'
                 flutter_app_vm_profile = 'true'
 
             flutter_app_debug_flags = ''
