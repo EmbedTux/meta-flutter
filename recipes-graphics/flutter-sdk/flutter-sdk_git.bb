@@ -132,14 +132,13 @@ python do_unpack:append() {
     run_command(d, 'flutter config --enable-linux-desktop', source_dir, env)
     run_command(d, 'flutter config --enable-custom-devices', source_dir, env)
     run_command(d, 'flutter config --enable-web', source_dir, env)
-    run_command(d, 'flutter config --enable-android', source_dir, env)
     run_command(d, 'flutter config --no-analytics', source_dir, env)
     run_command(d, 'dart --disable-analytics', source_dir, env)
     run_command(d, 'flutter config --list', source_dir, env)
 
     # check your installation and build the initial snapshot of the `flutter` tool
     run_command(d, 'flutter doctor -v', source_dir, env)
-
+    
     # download all of the pub package dependencies needed to build any of the packages in the Flutter main distribution
     run_command(d, 'flutter update-packages', source_dir, env)
 
@@ -150,9 +149,6 @@ python do_unpack:append() {
     run_command(d, 'flutter create --template=package package_sample', tmp_path, env)
     run_command(d, 'flutter create --template=plugin plugin_sample', tmp_path, env)
     run_command(d, f'rm -rf {tmp_path}', source_dir, env)
-
-    run_command(d, f'dart pub get --directory {source_dir}/packages/flutter_tools', source_dir, env)
-    run_command(d, 'flutter --suppress-analytics precache --linux --android --web', source_dir, env)
 }
 
 do_install() {
